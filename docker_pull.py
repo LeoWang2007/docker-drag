@@ -9,17 +9,35 @@ import requests
 import tarfile
 import urllib3
 import time
+import argparse
 
 urllib3.disable_warnings()
 
-if len(sys.argv) != 2:
-    print('Usage:\n\tdocker_pull.py [registry/][repository/]image[:tag|@digest]\n')
-    exit(1)
+def parse_platform(plat_str):
+    parts = plat_str.split('/')
+    if len(parts) == 2:
+        return {'os': parts[0], 'architecture': parts[1]}
+    elif len(parts) == 3:
+        return {'os': parts[0], 'architecture': parts[1], 'variant': parts[2]}
+    else:
+        raise ValueError(f'Invalid platform format: {plat_str}')
+
+parser = argparse.ArgumentParser(
+    description='Pull Docker image and save as tar file.',
+    epilog='If no registry is specified in the image name and --registry is not set, '
+           'the default registry "registry-1.docker.io" is used.'
+)
+parser.add_argument('image', help='Image name, e.g. ubuntu:latest or ghcr.io/owner/repo:tag')
+parser.add_argument('--platform', help='Target platform, e.g. linux/amd64, linux/arm64. If omitted, interactive selection.')
+args = parser.parse_args()
+
+# Get image name from command line arguments
+image_name = args.image
 
 # Look for the Docker image to download
 repo = 'library'
 tag = 'latest'
-imgparts = sys.argv[1].split('/')
+imgparts = image_name.split('/')
 try:
     img, tag = imgparts[-1].split('@')
 except ValueError:
@@ -109,40 +127,67 @@ if 'index' in content_type or 'manifest.list' in content_type:
         print('[-] No manifest found in index')
         exit(1)
 
-    if len(manifests) == 1:
-        # multi-arch manifest - only one platform available
-        selected_digest = manifests[0]['digest']
-        plat = manifests[0].get('platform', {})
-        print('[+] Only one platform available: {}/{} (digest: {})'.format(
-            plat.get('os', 'unknown'), plat.get('architecture', 'unknown'), selected_digest))
-    else:
-        # multi-arch manifest - multiple platforms available
-        print('[+] Multiple platforms available. Please select one:')
-        for idx, manifest in enumerate(manifests, start=1):
+    # Follow command-line argument for platform selection
+    if args.platform is not None:
+        target_plat = parse_platform(args.platform)
+        matched_digest = None
+        for manifest in manifests:
             plat = manifest.get('platform', {})
-            print('  {}. OS: {}, Arch: {}, Variant: {}, digest: {}'.format(
-                idx,
-                plat.get('os', 'unknown'),
-                plat.get('architecture', 'unknown'),
-                plat.get('variant', ''),
-                manifest['digest']
-            ))
-        while True:
-            try:
-                choice = input('Enter the number of your choice: ').strip()
-                if not choice:
-                    continue
-                idx = int(choice)
-                if 1 <= idx <= len(manifests):
-                    selected_digest = manifests[idx-1]['digest']
-                    plat = manifests[idx-1].get('platform', {})
-                    print('[+] Selected platform: {}/{} (digest: {})'.format(
-                        plat.get('os'), plat.get('architecture'), selected_digest))
-                    break
+            if plat.get('os') == target_plat.get('os') and plat.get('architecture') == target_plat.get('architecture'):
+                if 'variant' in target_plat:
+                    if plat.get('variant') == target_plat['variant']:
+                        matched_digest = manifest['digest']
+                        break
                 else:
-                    print('Invalid number. Please enter a number between 1 and {}.'.format(len(manifests)))
-            except ValueError:
-                print('Invalid input. Please enter a number.')
+                    matched_digest = manifest['digest']
+                    break
+        if not matched_digest:
+            print('[-] No manifest found for platform {}'.format(args.platform))
+            print('[+] Available platforms:')
+            for manifest in manifests:
+                plat = manifest.get('platform', {})
+                print("  OS: {}, Arch: {}, Variant: {}, digest: {}".format(
+                    plat.get('os', 'unknown'), plat.get('architecture', 'unknown'),
+                    plat.get('variant', ''), manifest['digest']))
+            exit(1)
+        selected_digest = matched_digest
+        print('[+] Selected platform: {}/{} (digest: {})'.format(
+            target_plat.get('os'), target_plat.get('architecture'), selected_digest))
+    else:
+        if len(manifests) == 1:
+            # multi-arch manifest - only one platform available
+            selected_digest = manifests[0]['digest']
+            plat = manifests[0].get('platform', {})
+            print('[+] Only one platform available: {}/{} (digest: {})'.format(
+                plat.get('os', 'unknown'), plat.get('architecture', 'unknown'), selected_digest))
+        else:
+            # multi-arch manifest - multiple platforms available
+            print('[+] Multiple platforms available. Please select one:')
+            for idx, manifest in enumerate(manifests, start=1):
+                plat = manifest.get('platform', {})
+                print('  {}. OS: {}, Arch: {}, Variant: {}, digest: {}'.format(
+                    idx,
+                    plat.get('os', 'unknown'),
+                    plat.get('architecture', 'unknown'),
+                    plat.get('variant', ''),
+                    manifest['digest']
+                ))
+            while True:
+                try:
+                    choice = input('Enter the number of your choice: ').strip()
+                    if not choice:
+                        continue
+                    idx = int(choice)
+                    if 1 <= idx <= len(manifests):
+                        selected_digest = manifests[idx-1]['digest']
+                        plat = manifests[idx-1].get('platform', {})
+                        print('[+] Selected platform: {}/{} (digest: {})'.format(
+                            plat.get('os'), plat.get('architecture'), selected_digest))
+                        break
+                    else:
+                        print('Invalid number. Please enter a number between 1 and {}.'.format(len(manifests)))
+                except ValueError:
+                    print('Invalid input. Please enter a number.')
 
     # Fetch the specific manifest by digest
     resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, selected_digest),
