@@ -10,8 +10,69 @@ import tarfile
 import urllib3
 import time
 import argparse
+import base64
 
 urllib3.disable_warnings()
+
+_auth_cache = {}
+_auth_config = {'username': None, 'password': None, 'token': None}
+
+def get_basic_auth_header():
+    if _auth_config['username'] and _auth_config['password'] is not None:
+        auth_str = base64.b64encode(f"{_auth_config['username']}:{_auth_config['password']}".encode()).decode()
+        return {'Authorization': 'Basic ' + auth_str}
+    return {}
+
+def get_token_from_auth_url(auth_url, service, scope):
+    if _auth_config['token']:
+        return _auth_config['token']
+    url = f"{auth_url}?service={service}&scope={scope}"
+    auth_headers = get_basic_auth_header()
+    try:
+        resp = requests.get(url, headers=auth_headers, verify=False, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            token = data.get('token') or data.get('access_token')
+            if token:
+                return token
+        print(f"[Warning] Token request failed: HTTP {resp.status_code}, {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Warning] Token request exception: {e}")
+    return None
+
+def do_request_with_auth(url, method='GET', headers=None, stream=False, timeout=60, auth_retry=True):
+    if headers is None:
+        headers = {}
+    req_headers = headers.copy()
+    if _auth_config['token']:
+        req_headers['Authorization'] = 'Bearer ' + _auth_config['token']
+    resp = requests.request(method, url, headers=req_headers, stream=stream, verify=False, timeout=timeout)
+    if resp.status_code == 401 and auth_retry and not _auth_config['token']:
+        auth_header = resp.headers.get('WWW-Authenticate', '')
+        realm = service = scope = None
+        parts = auth_header.split(',')
+        for part in parts:
+            part = part.strip()
+            if 'realm=' in part:
+                realm = part.split('"')[1]
+            elif 'service=' in part:
+                service = part.split('"')[1]
+            elif 'scope=' in part:
+                scope = part.split('"')[1]
+        if realm and service and scope:
+            token = get_token_from_auth_url(realm, service, scope)
+            if token:
+                req_headers['Authorization'] = 'Bearer ' + token
+                resp = requests.request(method, url, headers=req_headers, stream=stream, verify=False, timeout=timeout)
+                if resp.status_code == 200:
+                    print("[+] Authentication succeeded.")
+                else:
+                    print(f"[-] Authentication succeeded but request still failed: {resp.status_code}")
+            else:
+                print("[-] Failed to obtain token.")
+        else:
+            print("[-] Could not parse WWW-Authenticate headers.")
+    return resp
 
 def parse_platform(plat_str):
     parts = plat_str.split('/')
@@ -57,27 +118,6 @@ else:
         repo = 'library'
 repository = '{}/{}'.format(repo, img)
 
-# Get Docker authentication endpoint when it is required
-auth_url = 'https://auth.docker.io/token'
-reg_service = 'registry.docker.io'
-resp = requests.get('https://{}/v2/'.format(registry), verify=False)
-if resp.status_code == 401:
-    auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
-    try:
-        reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
-    except IndexError:
-        reg_service = ""
-
-
-# Get Docker token (this function is useless for unauthenticated registries like Microsoft)
-def get_auth_head(type):
-    resp = requests.get('{}?service={}&scope=repository:{}:pull'.format(auth_url, reg_service, repository),
-                        verify=False)
-    access_token = resp.json()['token']
-    auth_head = {'Authorization': 'Bearer ' + access_token, 'Accept': type}
-    return auth_head
-
-
 def format_size(size_bytes):
     for unit in ['B', 'KB', 'MB', 'GB']:
         if size_bytes < 1024.0:
@@ -110,8 +150,8 @@ accept_all = (
 )
 
 # Fetch manifest v2 and get image layer digests
-auth_head = get_auth_head(accept_all)
-resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
+headers = {'Accept': accept_all}
+resp = do_request_with_auth(f'https://{registry}/v2/{repository}/manifests/{tag}', headers=headers)
 if resp.status_code != 200:
     print('[-] Cannot fetch manifest for {} [HTTP {}]'.format(repository, resp.status_code))
     print(resp.content)
@@ -190,8 +230,8 @@ if 'index' in content_type or 'manifest.list' in content_type:
                     print('Invalid input. Please enter a number.')
 
     # Fetch the specific manifest by digest
-    resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, selected_digest),
-                        headers=auth_head, verify=False)
+    resp = do_request_with_auth(f'https://{registry}/v2/{repository}/manifests/{selected_digest}',
+                                headers={'Accept': accept_all})
     if resp.status_code != 200:
         print('[-] Failed to fetch manifest for digest {}'.format(selected_digest))
         exit(1)
@@ -209,8 +249,8 @@ imgdir = 'tmp_{}_{}'.format(img, tag.replace(':', '@'))
 os.mkdir(imgdir)
 print('Creating image structure in: ' + imgdir)
 
-confresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, config), headers=auth_head,
-                        verify=False)
+confresp = do_request_with_auth(f'https://{registry}/v2/{repository}/blobs/{config}',
+                                headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'})
 file = open('{}/{}.json'.format(imgdir, config[7:]), 'wb')
 file.write(confresp.content)
 file.close()
@@ -243,17 +283,16 @@ for layer in layers:
     file.write('1.0')
     file.close()
 
-    auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
-    bresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, ublob), headers=auth_head,
-                         stream=True, verify=False)
-    if bresp.status_code != 200:  # When the layer is located at a custom URL
-        bresp = requests.get(layer['urls'][0], headers=auth_head, stream=True, verify=False)
-        if bresp.status_code != 200:
-            print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
-            print(bresp.content)
-            exit(1)
+    bresp = do_request_with_auth(f'https://{registry}/v2/{repository}/blobs/{ublob}',
+                                 headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
+                                 stream=True)
+    if bresp.status_code != 200 and 'urls' in layer:  # When the layer is located at a custom URL
+        bresp = do_request_with_auth(layer['urls'][0], stream=True)
+    if bresp.status_code != 200:
+        print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
+        print(bresp.content)
+        exit(1)
 
-    bresp.raise_for_status()
     total_size = int(bresp.headers.get('Content-Length', 0))
     downloaded = 0
     start_time = time.time()
