@@ -1,7 +1,6 @@
 import os
 import sys
 import gzip
-from io import BytesIO
 import json
 import hashlib
 import shutil
@@ -14,7 +13,7 @@ import base64
 
 urllib3.disable_warnings()
 
-_auth_cache = {}
+_auth_cache = {}  # {(auth_url, scope): token}
 _auth_config = {'username': None, 'password': None, 'token': None}
 
 def get_basic_auth_header():
@@ -26,6 +25,11 @@ def get_basic_auth_header():
 def get_token_from_auth_url(auth_url, service, scope):
     if _auth_config['token']:
         return _auth_config['token']
+
+    cache_key = (auth_url, scope)
+    if cache_key in _auth_cache:
+        return _auth_cache[cache_key]
+
     url = f"{auth_url}?service={service}&scope={scope}"
     auth_headers = get_basic_auth_header()
     try:
@@ -34,6 +38,7 @@ def get_token_from_auth_url(auth_url, service, scope):
             data = resp.json()
             token = data.get('token') or data.get('access_token')
             if token:
+                _auth_cache[cache_key] = token
                 return token
         print(f"[Warning] Token request failed: HTTP {resp.status_code}, {resp.text[:200]}")
     except Exception as e:
