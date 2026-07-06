@@ -146,6 +146,17 @@ def progress_with_speed(ublob, downloaded, total, start_time, bar_width=50):
         format_size(downloaded), format_size(total), speed_str))
     sys.stdout.flush()
 
+# Check SHA256
+def verify_sha256(file_path, expected_digest):
+    if not os.path.exists(file_path):
+        return False
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha256.update(chunk)
+    calc_digest = 'sha256:' + sha256.hexdigest()
+    return calc_digest == expected_digest
+
 # Support Docker V2, Docker Manifest List, OCI Index, OCI Manifest
 accept_all = (
     'application/vnd.docker.distribution.manifest.v2+json, '
@@ -288,39 +299,60 @@ for layer in layers:
     file.write('1.0')
     file.close()
 
-    bresp = do_request_with_auth(f'https://{registry}/v2/{repository}/blobs/{ublob}',
-                                 headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
-                                 stream=True)
-    if bresp.status_code != 200 and 'urls' in layer:  # When the layer is located at a custom URL
-        bresp = do_request_with_auth(layer['urls'][0], stream=True)
-    if bresp.status_code != 200:
-        print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
-        print(bresp.content)
-        exit(1)
+    gz_path = layerdir + '/layer_gzip.tar'
+    tar_path = layerdir + '/layer.tar'
 
-    total_size = int(bresp.headers.get('Content-Length', 0))
-    downloaded = 0
-    start_time = time.time()
+    if verify_sha256(gz_path, ublob):
+        print('[Skip] Layer {} already downloaded and verified.'.format(ublob[7:19]))
+        # Decpompress the gz file to tar if tar doesn't exist
+        if not os.path.exists(tar_path):
+            sys.stdout.write("{}: Extracting from cache...{}".format(ublob[7:19], " " * 50))
+            sys.stdout.flush()
+            with open(tar_path, 'wb') as f_out:
+                with gzip.open(gz_path, 'rb') as f_in:
+                    shutil.copyfileobj(f_in, f_out)
+            print("\r{}: Extracted from cache".format(ublob[7:19]))
+    else:
+        if os.path.exists(gz_path):
+            print('[Warning] Existing file {} has wrong checksum, re-downloading...'.format(gz_path))
 
-    with open(layerdir + '/layer_gzip.tar', "wb") as file:
-        for chunk in bresp.iter_content(chunk_size=8192):
-            if chunk:
-                file.write(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    progress_with_speed(ublob, downloaded, total_size, start_time)
-    # Prevent the progress bar from overwriting the output
-    sys.stdout.write('\n')
-    sys.stdout.flush()
+        bresp = do_request_with_auth(f'https://{registry}/v2/{repository}/blobs/{ublob}',
+                                     headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
+                                     stream=True)
+        if bresp.status_code != 200 and 'urls' in layer:  # When the layer is located at a custom URL
+            bresp = do_request_with_auth(layer['urls'][0], stream=True)
+        if bresp.status_code != 200:
+            print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
+            print(bresp.content)
+            exit(1)
 
-    sys.stdout.write("{}: Extracting...{}".format(ublob[7:19], " " * 50))
-    sys.stdout.flush()
-    with open(layerdir + '/layer.tar', "wb") as file:  # Decompress gzip response
-        unzLayer = gzip.open(layerdir + '/layer_gzip.tar', 'rb')
-        shutil.copyfileobj(unzLayer, file)
-        unzLayer.close()
-    os.remove(layerdir + '/layer_gzip.tar')
-    print("\r{}: Pull complete [{}]".format(ublob[7:19], bresp.headers.get('Content-Length', '?')))
+        total_size = int(bresp.headers.get('Content-Length', 0))
+        downloaded = 0
+        start_time = time.time()
+
+        with open(gz_path, "wb") as file:
+            for chunk in bresp.iter_content(chunk_size=8192):
+                if chunk:
+                    file.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress_with_speed(ublob, downloaded, total_size, start_time)
+        # Prevent the progress bar from overwriting the output
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+        if not verify_sha256(gz_path, ublob):
+            print('[Error] SHA256 mismatch after download for {}'.format(ublob[7:19]))
+            os.remove(gz_path)
+            exit(1)
+
+        sys.stdout.write("{}: Extracting...{}".format(ublob[7:19], " " * 50))
+        sys.stdout.flush()
+        with open(tar_path, "wb") as file:  # Decompress gzip response
+            unzLayer = gzip.open(gz_path, 'rb')
+            shutil.copyfileobj(unzLayer, file)
+            unzLayer.close()
+        print("\r{}: Pull complete [{}]".format(ublob[7:19], bresp.headers.get('Content-Length', '?')))
     content[0]['Layers'].append(fake_layerid + '/layer.tar')
 
     # Creating json file
