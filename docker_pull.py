@@ -8,6 +8,7 @@ import shutil
 import requests
 import tarfile
 import urllib3
+import time
 
 urllib3.disable_warnings()
 
@@ -59,17 +60,27 @@ def get_auth_head(type):
     return auth_head
 
 
-# Docker style progress bar
-def progress_bar(ublob, nb_traits):
-    sys.stdout.write('\r' + ublob[7:19] + ': Downloading [')
-    for i in range(0, nb_traits):
-        if i == nb_traits - 1:
-            sys.stdout.write('>')
-        else:
-            sys.stdout.write('=')
-    for i in range(0, 49 - nb_traits):
-        sys.stdout.write(' ')
-    sys.stdout.write(']')
+def format_size(size_bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} TB"
+
+
+def progress_with_speed(ublob, downloaded, total, start_time, bar_width=50):
+    if total == 0:
+        return
+    percent = downloaded / total
+    filled = int(bar_width * percent)
+    bar = '=' * (filled - 1) + '>' if filled > 0 else ''
+    bar = bar.ljust(bar_width, ' ')
+    elapsed = time.time() - start_time
+    speed = downloaded / elapsed if elapsed > 0 else 0
+    speed_str = format_size(speed) + '/s' if speed > 0 else '0 B/s'
+    sys.stdout.write('\r{}: [{}] {:.1f}% ({}/{}) {}          '.format(
+        ublob[7:19], bar, percent * 100,
+        format_size(downloaded), format_size(total), speed_str))
     sys.stdout.flush()
 
 # Support Docker V2, Docker Manifest List, OCI Index, OCI Manifest
@@ -187,9 +198,6 @@ for layer in layers:
     file.write('1.0')
     file.close()
 
-    # Creating layer.tar file
-    sys.stdout.write(ublob[7:19] + ': Downloading...')
-    sys.stdout.flush()
     auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
     bresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, ublob), headers=auth_head,
                          stream=True, verify=False)
@@ -199,29 +207,31 @@ for layer in layers:
             print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
             print(bresp.content)
             exit(1)
-    # Stream download and follow the progress
+
     bresp.raise_for_status()
-    unit = int(bresp.headers['Content-Length']) / 50
-    acc = 0
-    nb_traits = 0
-    progress_bar(ublob, nb_traits)
+    total_size = int(bresp.headers.get('Content-Length', 0))
+    downloaded = 0
+    start_time = time.time()
+
     with open(layerdir + '/layer_gzip.tar', "wb") as file:
         for chunk in bresp.iter_content(chunk_size=8192):
             if chunk:
                 file.write(chunk)
-                acc = acc + 8192
-                if acc > unit:
-                    nb_traits = nb_traits + 1
-                    progress_bar(ublob, nb_traits)
-                    acc = 0
-    sys.stdout.write("\r{}: Extracting...{}".format(ublob[7:19], " " * 50))  # Ugly but works everywhere
+                downloaded += len(chunk)
+                if total_size > 0:
+                    progress_with_speed(ublob, downloaded, total_size, start_time)
+    # Prevent the progress bar from overwriting the output
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+
+    sys.stdout.write("{}: Extracting...{}".format(ublob[7:19], " " * 50))
     sys.stdout.flush()
     with open(layerdir + '/layer.tar', "wb") as file:  # Decompress gzip response
         unzLayer = gzip.open(layerdir + '/layer_gzip.tar', 'rb')
         shutil.copyfileobj(unzLayer, file)
         unzLayer.close()
     os.remove(layerdir + '/layer_gzip.tar')
-    print("\r{}: Pull complete [{}]".format(ublob[7:19], bresp.headers['Content-Length']))
+    print("\r{}: Pull complete [{}]".format(ublob[7:19], bresp.headers.get('Content-Length', '?')))
     content[0]['Layers'].append(fake_layerid + '/layer.tar')
 
     # Creating json file
