@@ -10,6 +10,7 @@ import urllib3
 import time
 import argparse
 import base64
+import getpass
 
 urllib3.disable_warnings()
 
@@ -95,7 +96,22 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('image', help='Image name, e.g. ubuntu:latest or ghcr.io/owner/repo:tag')
 parser.add_argument('--platform', help='Target platform, e.g. linux/amd64, linux/arm64. If omitted, interactive selection.')
+parser.add_argument('--registry', '-r', help='Override registry (e.g. registry.cn-hangzhou.aliyuncs.com).')
+parser.add_argument('--username', '-u', help='Registry username')
+parser.add_argument('--password', '-p', help='Registry password (insecure, use --password-stdin)')
+parser.add_argument('--password-stdin', action='store_true', help='Read password from stdin')
+parser.add_argument('--token', '-t', help='Direct bearer token (bypass token exchange)')
 args = parser.parse_args()
+
+if args.password_stdin:
+    password = sys.stdin.readline().strip()
+    args.password = password
+if args.username and args.password is None:
+    args.password = getpass.getpass('Enter registry password: ')
+
+_auth_config['username'] = args.username
+_auth_config['password'] = args.password
+_auth_config['token'] = args.token
 
 # Get image name from command line arguments
 image_name = args.image
@@ -121,6 +137,10 @@ else:
         repo = '/'.join(imgparts[:-1])
     else:
         repo = 'library'
+
+if args.registry:
+    registry = args.registry
+
 repository = '{}/{}'.format(repo, img)
 
 def format_size(size_bytes):
