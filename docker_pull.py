@@ -72,32 +72,51 @@ def progress_bar(ublob, nb_traits):
     sys.stdout.write(']')
     sys.stdout.flush()
 
+# Support Docker V2, Docker Manifest List, OCI Index, OCI Manifest
+accept_all = (
+    'application/vnd.docker.distribution.manifest.v2+json, '
+    'application/vnd.docker.distribution.manifest.list.v2+json, '
+    'application/vnd.oci.image.index.v1+json, '
+    'application/vnd.oci.image.manifest.v1+json'
+)
 
 # Fetch manifest v2 and get image layer digests
-auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
+auth_head = get_auth_head(accept_all)
 resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
 if resp.status_code != 200:
     print('[-] Cannot fetch manifest for {} [HTTP {}]'.format(repository, resp.status_code))
     print(resp.content)
-    auth_head = get_auth_head('application/vnd.docker.distribution.manifest.list.v2+json')
-    resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head,
-                        verify=False)
-    if resp.status_code == 200:
-        print('[+] Manifests found for this tag (use the @digest format to pull the corresponding image):')
-        manifests = resp.json()['manifests']
-        for manifest in manifests:
-            for key, value in manifest["platform"].items():
-                sys.stdout.write('{}: {}, '.format(key, value))
-            print('digest: {}'.format(manifest["digest"]))
     exit(1)
-layers = resp.json()['layers']
+
+# Check single or multi-arch manifest
+content_type = resp.headers.get('Content-Type', '')
+resp_json = resp.json()
+
+if 'index' in content_type or 'manifest.list' in content_type:
+    # multi-arch manifest
+    print('[+] Manifests found for this tag (use the @digest format to pull the corresponding image):')
+    manifests = resp_json.get('manifests', [])
+    for manifest in manifests:
+        platform = manifest.get('platform', {})
+        os_ = platform.get('os', 'unknown')
+        arch = platform.get('architecture', 'unknown')
+        variant = platform.get('variant', '')
+        digest = manifest.get('digest', '')
+        print('OS: {}, Architecture: {}, Variant: {}, digest: {}'.format(os_, arch, variant, digest))
+    exit(1)
+
+# single-arch manifest
+layers = resp_json.get('layers')
+if layers is None:
+    print('[-] No layers found in manifest (maybe unsupported format)')
+    exit(1)
+config = resp_json['config']['digest']
 
 # Create tmp folder that will hold the image
 imgdir = 'tmp_{}_{}'.format(img, tag.replace(':', '@'))
 os.mkdir(imgdir)
 print('Creating image structure in: ' + imgdir)
 
-config = resp.json()['config']['digest']
 confresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, config), headers=auth_head,
                         verify=False)
 file = open('{}/{}.json'.format(imgdir, config[7:]), 'wb')
@@ -141,8 +160,7 @@ for layer in layers:
     if bresp.status_code != 200:  # When the layer is located at a custom URL
         bresp = requests.get(layer['urls'][0], headers=auth_head, stream=True, verify=False)
         if bresp.status_code != 200:
-            print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code,
-                                                                       bresp.headers['Content-Length']))
+            print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code))
             print(bresp.content)
             exit(1)
     # Stream download and follow the progress
