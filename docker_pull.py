@@ -93,17 +93,53 @@ content_type = resp.headers.get('Content-Type', '')
 resp_json = resp.json()
 
 if 'index' in content_type or 'manifest.list' in content_type:
-    # multi-arch manifest
-    print('[+] Manifests found for this tag (use the @digest format to pull the corresponding image):')
     manifests = resp_json.get('manifests', [])
-    for manifest in manifests:
-        platform = manifest.get('platform', {})
-        os_ = platform.get('os', 'unknown')
-        arch = platform.get('architecture', 'unknown')
-        variant = platform.get('variant', '')
-        digest = manifest.get('digest', '')
-        print('OS: {}, Architecture: {}, Variant: {}, digest: {}'.format(os_, arch, variant, digest))
-    exit(1)
+    if not manifests:
+        print('[-] No manifest found in index')
+        exit(1)
+
+    if len(manifests) == 1:
+        # multi-arch manifest - only one platform available
+        selected_digest = manifests[0]['digest']
+        plat = manifests[0].get('platform', {})
+        print('[+] Only one platform available: {}/{} (digest: {})'.format(
+            plat.get('os', 'unknown'), plat.get('architecture', 'unknown'), selected_digest))
+    else:
+        # multi-arch manifest - multiple platforms available
+        print('[+] Multiple platforms available. Please select one:')
+        for idx, manifest in enumerate(manifests, start=1):
+            plat = manifest.get('platform', {})
+            print('  {}. OS: {}, Arch: {}, Variant: {}, digest: {}'.format(
+                idx,
+                plat.get('os', 'unknown'),
+                plat.get('architecture', 'unknown'),
+                plat.get('variant', ''),
+                manifest['digest']
+            ))
+        while True:
+            try:
+                choice = input('Enter the number of your choice: ').strip()
+                if not choice:
+                    continue
+                idx = int(choice)
+                if 1 <= idx <= len(manifests):
+                    selected_digest = manifests[idx-1]['digest']
+                    plat = manifests[idx-1].get('platform', {})
+                    print('[+] Selected platform: {}/{} (digest: {})'.format(
+                        plat.get('os'), plat.get('architecture'), selected_digest))
+                    break
+                else:
+                    print('Invalid number. Please enter a number between 1 and {}.'.format(len(manifests)))
+            except ValueError:
+                print('Invalid input. Please enter a number.')
+
+    # Fetch the specific manifest by digest
+    resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, selected_digest),
+                        headers=auth_head, verify=False)
+    if resp.status_code != 200:
+        print('[-] Failed to fetch manifest for digest {}'.format(selected_digest))
+        exit(1)
+    resp_json = resp.json()
 
 # single-arch manifest
 layers = resp_json.get('layers')
